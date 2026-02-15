@@ -9,6 +9,7 @@ Requisitos: macOS, haber iniciado sesión en Claude Code (claude) al menos una v
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -27,6 +28,8 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 KEYCHAIN_TIMEOUT = 30
 
 RESET = "\033[0m"
+CURSOR_HIDE = "\033[?25l"
+CURSOR_SHOW = "\033[?25h"
 BAR_WIDTH = 12
 BAR_FILLED = "\u2588"
 BAR_EMPTY = "\u2591"
@@ -146,6 +149,21 @@ def format_reset_time(resets_at):
         return ""
 
 
+def format_reset_at_local(resets_at):
+    """Hora del próximo corte en hora local (HH:MM)."""
+    if not resets_at:
+        return ""
+    try:
+        ts = resets_at.strip().replace("Z", "+00:00")
+        if "." in ts:
+            ts = ts.split(".")[0] + "+00:00"
+        reset_dt = datetime.fromisoformat(ts)
+        local = reset_dt.astimezone()
+        return local.strftime("%H:%M")
+    except Exception:
+        return ""
+
+
 def bar(pct):
     pct = int(pct)
     filled = max(0, min(BAR_WIDTH, pct * BAR_WIDTH // 100))
@@ -153,25 +171,91 @@ def bar(pct):
     return f"{c}{BAR_FILLED * filled}{DIM}{BAR_EMPTY * (BAR_WIDTH - filled)}{RESET}"
 
 
+# Bordes del recuadro (estilo lazygit/btop)
+BOX_TOP_LEFT = "\u250c"
+BOX_TOP_RIGHT = "\u2510"
+BOX_BOTTOM_LEFT = "\u2514"
+BOX_BOTTOM_RIGHT = "\u2518"
+BOX_H = "\u2500"
+BOX_V = "\u2502"
+
+ANSI_STRIP = re.compile(r"\033\[[0-9;]*m")
+
+
+def visible_len(s):
+    """Longitud visible del texto (sin contar códigos ANSI)."""
+    return len(ANSI_STRIP.sub("", s))
+
+
+def pad_to_width(s, width, align="left"):
+    """Rellena la línea hasta `width` caracteres visibles. align: 'left', 'center', 'right'."""
+    n = width - visible_len(s)
+    if n <= 0:
+        return s
+    pad = " " * n
+    if align == "center":
+        left = n // 2
+        return " " * left + s + " " * (n - left)
+    if align == "right":
+        return pad + s
+    return s + pad
+
+
+def get_box_width():
+    """Ancho interior del recuadro (terminal - bordes)."""
+    try:
+        return os.get_terminal_size().columns - 2
+    except OSError:
+        return 78
+
+
 def render_screen(usage, last_update, error_msg=None):
-    """Limpia la pantalla y muestra el panel de uso."""
+    """Limpia la pantalla y muestra el panel de uso dentro de un recuadro."""
+    w = get_box_width()
+    title_text = " Claude Pro "
+    title_styled = ACCENT + title_text + RESET
+    title_len = visible_len(title_styled)
+    dash_total = max(0, w - title_len)
+    left_dashes = dash_total // 2
+    right_dashes = dash_total - left_dashes
+    top = BOX_TOP_LEFT + BOX_H * left_dashes + title_styled + BOX_H * right_dashes + BOX_TOP_RIGHT
+    bottom = BOX_BOTTOM_LEFT + BOX_H * w + BOX_BOTTOM_RIGHT
+
+    def line(content, align="left"):
+        return BOX_V + pad_to_width(content, w, align) + BOX_V
+
     print("\033[2J\033[H", end="")
-    print(f"{ACCENT}Claude Pro — Uso en vivo (misma API que /usage){RESET}")
-    print(f"{DIM}Credenciales: Claude Code (Keychain) · Actualizando cada {POLL_INTERVAL} s · {last_update}{RESET}\n")
+    print()
+    print(top)
+    print(line(""))
+
     if error_msg:
-        print(f"{RED}{error_msg}{RESET}\n")
-    if usage:
+        msg = RED + error_msg + RESET
+        print(line(msg))
+    elif usage:
         five = usage.get("five_hour") or {}
         seven = usage.get("seven_day") or {}
         p5 = int(float(five.get("utilization", 0)))
         p7 = int(float(seven.get("utilization", 0)))
         r5 = format_reset_time(five.get("resets_at"))
         r7 = format_reset_time(seven.get("resets_at"))
-        print(f"  {LABEL}5h (sesión){RESET}   {bar(p5)} {color_for_pct(p5)}{p5}%{RESET}   Resetea {DIM}{r5}{RESET}")
-        print(f"  {LABEL}7d (semana){RESET}   {bar(p7)} {color_for_pct(p7)}{p7}%{RESET}   Resetea {DIM}{r7}{RESET}")
-    elif not error_msg:
-        print(f"  {DIM}Cargando uso...{RESET}")
-    print(f"\n{DIM}Ctrl+C para salir{RESET}")
+        at5 = format_reset_at_local(five.get("resets_at"))
+        r5_display = f"{r5} ({at5})" if at5 else r5
+        row5 = f"  {LABEL}5h{RESET}   {bar(p5)}  {color_for_pct(p5)}{p5}%{RESET}   {DIM}{r5_display}{RESET}"
+        row7 = f"  {LABEL}7d{RESET}   {bar(p7)}  {color_for_pct(p7)}{p7}%{RESET}   {DIM}{r7}{RESET}"
+        print(line(row5))
+        print(line(row7))
+    else:
+        print(line(DIM + "cargando..." + RESET, "center"))
+
+    print(line(""))
+    time_styled = DIM + last_update + RESET
+    time_len = visible_len(time_styled)
+    dash_total = max(0, w - time_len)
+    left_dashes = dash_total // 2
+    right_dashes = dash_total - left_dashes
+    bottom = BOX_BOTTOM_LEFT + BOX_H * left_dashes + time_styled + BOX_H * right_dashes + BOX_BOTTOM_RIGHT
+    print(bottom)
 
 
 # =============================================================================
@@ -179,15 +263,16 @@ def render_screen(usage, last_update, error_msg=None):
 # =============================================================================
 
 def main():
-    last_update = datetime.now().strftime("%H:%M:%S")
-    token, err = get_claude_code_token()
-    if err:
-        render_screen(None, last_update, err)
-        try:
+    print(CURSOR_HIDE, end="")
+    try:
+        last_update = datetime.now().strftime("%H:%M")
+        token, err = get_claude_code_token()
+        if err:
+            render_screen(None, last_update, err)
             while True:
                 time.sleep(POLL_INTERVAL)
                 token, err = get_claude_code_token()
-                last_update = datetime.now().strftime("%H:%M:%S")
+                last_update = datetime.now().strftime("%H:%M")
                 if not err and token:
                     usage, api_err = fetch_usage(token)
                     if api_err:
@@ -196,32 +281,28 @@ def main():
                         render_screen(usage, last_update, None)
                 else:
                     render_screen(None, last_update, err)
-        except KeyboardInterrupt:
-            print("\n")
-            sys.exit(0)
-
-    usage, api_err = fetch_usage(token)
-    if api_err:
-        render_screen(None, last_update, api_err)
-    else:
-        render_screen(usage, last_update, None)
-
-    try:
-        while True:
-            time.sleep(POLL_INTERVAL)
-            token, err = get_claude_code_token()
-            last_update = datetime.now().strftime("%H:%M:%S")
-            if err:
-                render_screen(None, last_update, err)
-                continue
+        else:
             usage, api_err = fetch_usage(token)
             if api_err:
                 render_screen(None, last_update, api_err)
             else:
                 render_screen(usage, last_update, None)
+            while True:
+                time.sleep(POLL_INTERVAL)
+                token, err = get_claude_code_token()
+                last_update = datetime.now().strftime("%H:%M")
+                if err:
+                    render_screen(None, last_update, err)
+                    continue
+                usage, api_err = fetch_usage(token)
+                if api_err:
+                    render_screen(None, last_update, api_err)
+                else:
+                    render_screen(usage, last_update, None)
     except KeyboardInterrupt:
-        print("\n")
-        sys.exit(0)
+        print()
+    finally:
+        print(CURSOR_SHOW, end="")
 
 
 if __name__ == "__main__":
