@@ -10,6 +10,7 @@ Requisitos: macOS, haber iniciado sesión en Claude Code (claude) al menos una v
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -211,6 +212,9 @@ def get_box_width():
 
 def render_screen(usage, last_update, error_msg=None):
     """Limpia la pantalla y muestra el panel de uso dentro de un recuadro."""
+    _state["usage"] = usage
+    _state["last_update"] = last_update
+    _state["error_msg"] = error_msg
     w = get_box_width()
     title_text = " Claude Pro "
     title_styled = ACCENT + title_text + RESET
@@ -241,14 +245,29 @@ def render_screen(usage, last_update, error_msg=None):
         r7 = format_reset_time(seven.get("resets_at"))
         at5 = format_reset_at_local(five.get("resets_at"))
         r5_display = f"{r5} ({at5})" if at5 else r5
-        row5 = f"  {LABEL}5h{RESET}   {bar(p5)}  {color_for_pct(p5)}{p5}%{RESET}   {DIM}{r5_display}{RESET}"
-        row7 = f"  {LABEL}7d{RESET}   {bar(p7)}  {color_for_pct(p7)}{p7}%{RESET}   {DIM}{r7}{RESET}"
-        print(line(row5))
-        print(line(row7))
+        # Ancho visible de una fila sin el reset:
+        # "  5h   " + bar(12) + "  100%   " = 2+2+3+12+2+4+3 = 28
+        # Si no cabe el reset en la misma línea, lo bajamos a la siguiente
+        row_base_w = 2 + 2 + 3 + BAR_WIDTH + 2 + 4 + 3
+        compact = w < row_base_w + max(len(r5_display), len(r7))
+        if compact:
+            row5 = f"  {LABEL}5h{RESET}   {bar(p5)}  {color_for_pct(p5)}{p5}%{RESET}"
+            row7 = f"  {LABEL}7d{RESET}   {bar(p7)}  {color_for_pct(p7)}{p7}%{RESET}"
+            reset5 = f"       {DIM}{r5_display}{RESET}"
+            reset7 = f"       {DIM}{r7}{RESET}"
+            print(line(row5))
+            print(line(reset5))
+            print(line(row7))
+            print(line(reset7))
+        else:
+            row5 = f"  {LABEL}5h{RESET}   {bar(p5)}  {color_for_pct(p5)}{p5}%{RESET}   {DIM}{r5_display}{RESET}"
+            row7 = f"  {LABEL}7d{RESET}   {bar(p7)}  {color_for_pct(p7)}{p7}%{RESET}   {DIM}{r7}{RESET}"
+            print(line(row5))
+            print(line(row7))
+            print(line(""))
     else:
         print(line(DIM + "cargando..." + RESET, "center"))
-
-    print(line(""))
+        print(line(""))
     time_styled = DIM + last_update + RESET
     time_len = visible_len(time_styled)
     dash_total = max(0, w - time_len)
@@ -256,6 +275,20 @@ def render_screen(usage, last_update, error_msg=None):
     right_dashes = dash_total - left_dashes
     bottom = BOX_BOTTOM_LEFT + BOX_H * left_dashes + time_styled + BOX_H * right_dashes + BOX_BOTTOM_RIGHT
     print(bottom)
+
+
+# =============================================================================
+# Estado global (para redibujar al redimensionar)
+# =============================================================================
+
+_state = {"usage": None, "last_update": "", "error_msg": None}
+
+
+def _on_resize(signum, frame):
+    render_screen(_state["usage"], _state["last_update"], _state["error_msg"])
+
+
+signal.signal(signal.SIGWINCH, _on_resize)
 
 
 # =============================================================================
