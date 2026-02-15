@@ -1,0 +1,3 @@
+# No hay dependencias: el script usa solo la biblioteca estándar de Python.
+# Opcional: si en el futuro se añade 'rich' para una tabla más bonita:
+# rich>=13.0.0
