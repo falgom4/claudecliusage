@@ -239,8 +239,12 @@ def render_screen(usage, last_update, error_msg=None):
     elif usage:
         five = usage.get("five_hour") or {}
         seven = usage.get("seven_day") or {}
+        extra = usage.get("extra_usage") or usage.get("extra_hour") or {}
+        has_extra = extra and (extra.get("utilization") is not None or extra.get("resets_at"))
+
         p5 = int(float(five.get("utilization", 0)))
         p7 = int(float(seven.get("utilization", 0)))
+        show_7d = p7 > 0
         r5 = format_reset_time(five.get("resets_at"))
         r7 = format_reset_time(seven.get("resets_at"))
         at5 = format_reset_at_local(five.get("resets_at"))
@@ -249,22 +253,40 @@ def render_screen(usage, last_update, error_msg=None):
         # "  5h   " + bar(12) + "  100%   " = 2+2+3+12+2+4+3 = 28
         # Si no cabe el reset en la misma línea, lo bajamos a la siguiente
         row_base_w = 2 + 2 + 3 + BAR_WIDTH + 2 + 4 + 3
-        compact = w < row_base_w + max(len(r5_display), len(r7))
+        compact = w < row_base_w + max(len(r5_display), len(r7) if show_7d else 0)
         if compact:
             row5 = f"  {LABEL}5h{RESET}   {bar(p5)}  {color_for_pct(p5)}{p5}%{RESET}"
-            row7 = f"  {LABEL}7d{RESET}   {bar(p7)}  {color_for_pct(p7)}{p7}%{RESET}"
             reset5 = f"       {DIM}{r5_display}{RESET}"
-            reset7 = f"       {DIM}{r7}{RESET}"
             print(line(row5))
             print(line(reset5))
-            print(line(row7))
-            print(line(reset7))
+            if show_7d:
+                row7 = f"  {LABEL}7d{RESET}   {bar(p7)}  {color_for_pct(p7)}{p7}%{RESET}"
+                reset7 = f"       {DIM}{r7}{RESET}"
+                print(line(row7))
+                print(line(reset7))
         else:
             row5 = f"  {LABEL}5h{RESET}   {bar(p5)}  {color_for_pct(p5)}{p5}%{RESET}   {DIM}{r5_display}{RESET}"
-            row7 = f"  {LABEL}7d{RESET}   {bar(p7)}  {color_for_pct(p7)}{p7}%{RESET}   {DIM}{r7}{RESET}"
             print(line(row5))
-            print(line(row7))
-            print(line(""))
+            if show_7d:
+                row7 = f"  {LABEL}7d{RESET}   {bar(p7)}  {color_for_pct(p7)}{p7}%{RESET}   {DIM}{r7}{RESET}"
+                print(line(row7))
+
+        if has_extra:
+            pe = int(float(extra.get("utilization", 0)))
+            re = format_reset_time(extra.get("resets_at"))
+            ate = format_reset_at_local(extra.get("resets_at"))
+            re_display = f"{re} ({ate})" if ate else re
+            extra_label = extra.get("label", "Extra")
+            if compact:
+                row_extra = f"  {LABEL}{extra_label}{RESET}   {bar(pe)}  {color_for_pct(pe)}{pe}%{RESET}"
+                reset_extra = f"       {DIM}{re_display}{RESET}"
+                print(line(row_extra))
+                print(line(reset_extra))
+            else:
+                row_extra = f"  {LABEL}{extra_label}{RESET}   {bar(pe)}  {color_for_pct(pe)}{pe}%{RESET}   {DIM}{re_display}{RESET}"
+                print(line(row_extra))
+
+        print(line(""))
     else:
         print(line(DIM + "cargando..." + RESET, "center"))
         print(line(""))
