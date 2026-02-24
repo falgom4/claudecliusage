@@ -420,19 +420,31 @@ def render_screen(tab, usage=None, last_update=None, error_msg=None):
     else:
         _render_cursor_body(usage, last_update, error_msg, w, line)
 
-    # Indicador de flechas para cambiar de vista (vista activa resaltada)
+    # Borde inferior: ← Claude Pro ──── HH:MM ──── Cursor → (activa en ACCENT, otra en DIM)
+    left_text  = " ← Claude Pro "
+    right_text = " Cursor → "
     if current == TAB_CLAUDE:
-        arrow_hint = f"  ← {ACCENT}Claude Pro{RESET}   {DIM}Cursor{RESET} →  "
+        left_styled  = ACCENT + left_text  + RESET
+        right_styled = DIM    + right_text + RESET
     else:
-        arrow_hint = f"  ← {DIM}Claude Pro{RESET}   {ACCENT}Cursor{RESET} →  "
-    print(line(arrow_hint, "center"))
-
+        left_styled  = DIM    + left_text  + RESET
+        right_styled = ACCENT + right_text + RESET
     time_styled = DIM + last_update + RESET
-    time_len = visible_len(time_styled)
-    dash_total = max(0, w - time_len)
-    left_dashes = dash_total // 2
-    right_dashes = dash_total - left_dashes
-    bottom = BOX_BOTTOM_LEFT + BOX_H * left_dashes + time_styled + BOX_H * right_dashes + BOX_BOTTOM_RIGHT
+
+    left_len  = len(left_text)
+    right_len = len(right_text)
+    time_len  = len(last_update)
+    middle_w  = max(0, w - left_len - right_len)
+    gap       = max(0, middle_w - time_len)
+    lg = gap // 2
+    rg = gap - lg
+    bottom = (
+        BOX_BOTTOM_LEFT
+        + left_styled
+        + BOX_H * lg + time_styled + BOX_H * rg
+        + right_styled
+        + BOX_BOTTOM_RIGHT
+    )
     print(bottom)
 
 
