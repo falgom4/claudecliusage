@@ -27,6 +27,7 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 POLL_INTERVAL = 30  # segundos
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 KEYCHAIN_TIMEOUT = 30
+SESSION_REFRESH_WAIT = 8  # segundos a esperar tras lanzar claude para que guarde el token
 
 RESET = "\033[0m"
 CURSOR_HIDE = "\033[?25l"
@@ -91,6 +92,39 @@ def get_claude_code_token():
         return token, None
     except json.JSONDecodeError:
         return None, "Credenciales en Keychain no son JSON válido. Re-inicia sesión en 'claude'."
+
+
+# =============================================================================
+# Renovación de sesión (cuando el token expira)
+# =============================================================================
+
+def _is_auth_error(msg):
+    """Devuelve True si el mensaje de error indica sesión expirada o token inválido."""
+    if not msg:
+        return False
+    low = msg.lower()
+    return any(k in low for k in ("unauthorized", "invalid", "expired", "unauthenticated", "401"))
+
+
+def refresh_session(render_fn, last_update):
+    """Abre claude en background para renovar el token y lo cierra tras SESSION_REFRESH_WAIT s."""
+    render_fn(None, last_update, "Sesión expirada — renovando credenciales…")
+    try:
+        proc = subprocess.Popen(
+            ["claude", "--print", ""],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+        time.sleep(SESSION_REFRESH_WAIT)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except FileNotFoundError:
+        render_fn(None, last_update, "No se encontró el comando 'claude'. ¿Está instalado?")
+        time.sleep(POLL_INTERVAL)
 
 
 # =============================================================================
@@ -276,14 +310,24 @@ def render_screen(usage, last_update, error_msg=None):
             re = format_reset_time(extra.get("resets_at"))
             ate = format_reset_at_local(extra.get("resets_at"))
             re_display = f"{re} ({ate})" if ate else re
-            extra_label = extra.get("label", "Extra")
+            extra_label = extra.get("label", "Ex")
+            # Dólares usados (amount_spent, spend o dollars_used)
+            raw_spend = extra.get("amount_spent") if extra.get("amount_spent") is not None else extra.get("spend", extra.get("dollars_used"))
+            if raw_spend is not None:
+                try:
+                    usd = float(raw_spend)
+                    usd_str = f"  ${usd:.2f}"
+                except (TypeError, ValueError):
+                    usd_str = ""
+            else:
+                usd_str = ""
             if compact:
-                row_extra = f"  {LABEL}{extra_label}{RESET}   {bar(pe)}  {color_for_pct(pe)}{pe}%{RESET}"
+                row_extra = f"  {LABEL}{extra_label}{RESET}   {bar(pe)}  {color_for_pct(pe)}{pe}%{RESET}{usd_str}"
                 reset_extra = f"       {DIM}{re_display}{RESET}"
                 print(line(row_extra))
                 print(line(reset_extra))
             else:
-                row_extra = f"  {LABEL}{extra_label}{RESET}   {bar(pe)}  {color_for_pct(pe)}{pe}%{RESET}   {DIM}{re_display}{RESET}"
+                row_extra = f"  {LABEL}{extra_label}{RESET}   {bar(pe)}  {color_for_pct(pe)}{pe}%{RESET}   {DIM}{re_display}{RESET}{usd_str}"
                 print(line(row_extra))
 
         print(line(""))
@@ -320,40 +364,30 @@ signal.signal(signal.SIGWINCH, _on_resize)
 def main():
     print(CURSOR_HIDE, end="")
     try:
-        last_update = datetime.now().strftime("%H:%M")
-        token, err = get_claude_code_token()
-        if err:
-            render_screen(None, last_update, err)
-            while True:
-                time.sleep(POLL_INTERVAL)
-                token, err = get_claude_code_token()
-                last_update = datetime.now().strftime("%H:%M")
-                if not err and token:
-                    usage, api_err = fetch_usage(token)
-                    if api_err:
-                        render_screen(None, last_update, api_err)
-                    else:
-                        render_screen(usage, last_update, None)
+        while True:
+            last_update = datetime.now().strftime("%H:%M")
+            token, err = get_claude_code_token()
+
+            if err:
+                if _is_auth_error(err):
+                    refresh_session(render_screen, last_update)
                 else:
                     render_screen(None, last_update, err)
-        else:
+                    time.sleep(POLL_INTERVAL)
+                continue
+
             usage, api_err = fetch_usage(token)
+            last_update = datetime.now().strftime("%H:%M")
+
             if api_err:
-                render_screen(None, last_update, api_err)
+                if _is_auth_error(api_err):
+                    refresh_session(render_screen, last_update)
+                else:
+                    render_screen(None, last_update, api_err)
+                    time.sleep(POLL_INTERVAL)
             else:
                 render_screen(usage, last_update, None)
-            while True:
                 time.sleep(POLL_INTERVAL)
-                token, err = get_claude_code_token()
-                last_update = datetime.now().strftime("%H:%M")
-                if err:
-                    render_screen(None, last_update, err)
-                    continue
-                usage, api_err = fetch_usage(token)
-                if api_err:
-                    render_screen(None, last_update, api_err)
-                else:
-                    render_screen(usage, last_update, None)
     except KeyboardInterrupt:
         print()
     finally:
