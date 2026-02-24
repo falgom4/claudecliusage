@@ -325,7 +325,7 @@ def _render_claude_body(usage, last_update, error_msg, w, line):
 
 
 def _render_cursor_body(usage, last_update, error_msg, w, line):
-    """Contenido del recuadro para la pestaña Cursor (placeholder hasta tener fetch)."""
+    """Contenido del recuadro para la pestaña Cursor: costo gastado / $20 incluidos."""
     if error_msg:
         msg = RED + error_msg + RESET
         print(line(msg))
@@ -334,21 +334,50 @@ def _render_cursor_body(usage, last_update, error_msg, w, line):
         print(line(DIM + "cargando..." + RESET, "center"))
         print(line(""))
         return
-    # Cursor: usage es dict con premium current/limit y opcional startOfMonth
-    premium = usage.get("premium") or {}
-    current = premium.get("current", 0)
-    limit = premium.get("limit") or 1
-    pct = int(100 * current / limit) if limit else 0
+
+    spent = usage.get("spent_dollars", 0.0)
+    included = usage.get("included_dollars", 20.0)
+    pct = int(100 * spent / included) if included else 0
+    pct = min(pct, 100)
+
+    # Fila principal: barra + porcentaje + costo
+    cost_str = f"${spent:.2f} / ${included:.2f}"
+    row = f"  {LABEL}Gasto{RESET}   {bar(pct)}  {color_for_pct(pct)}{pct}%{RESET}   {DIM}{cost_str}{RESET}"
+    compact = w < 2 + 7 + BAR_WIDTH + 2 + 4 + 3 + 3 + len(cost_str)
+    if compact:
+        print(line(f"  {LABEL}Gasto{RESET}   {bar(pct)}  {color_for_pct(pct)}{pct}%{RESET}"))
+        print(line(f"         {color_for_pct(pct)}{cost_str}{RESET}"))
+    else:
+        print(line(row))
+
+    # Línea de período
     start_of_month = usage.get("startOfMonth") or ""
-    row = f"  {LABEL}Premium{RESET}  {bar(pct)}  {color_for_pct(pct)}{pct}%{RESET}"
-    print(line(row))
+    period_month = usage.get("period_month")
+    period_year = usage.get("period_year")
     if start_of_month:
         try:
-            dt = datetime.fromisoformat(start_of_month.replace("Z", "+00:00"))
-            period_str = dt.strftime("%d %b")
+            ts = start_of_month.replace("Z", "+00:00")
+            if "." in ts:
+                ts = ts.split(".")[0] + "+00:00"
+            sub_start = datetime.fromisoformat(ts)
+            if period_month and period_year:
+                p_start = sub_start.replace(year=period_year, month=period_month)
+                p_end_month = period_month % 12 + 1
+                p_end_year = period_year + (1 if period_month == 12 else 0)
+                p_end = sub_start.replace(year=p_end_year, month=p_end_month)
+                period_str = f"{p_start.strftime('%d %b')} – {p_end.strftime('%d %b')}"
+            else:
+                period_str = sub_start.strftime("%d %b")
         except Exception:
-            period_str = start_of_month[:10] if len(start_of_month) >= 10 else start_of_month
-        print(line(f"       {DIM}desde {period_str}{RESET}"))
+            period_str = ""
+        if period_str:
+            print(line(f"         {DIM}{period_str}{RESET}"))
+
+    # Indicador de factura pendiente a mitad de mes
+    if usage.get("has_unpaid"):
+        mid_paid = usage.get("mid_month_paid", 0.0)
+        print(line(f"         {YELLOW}factura parcial pendiente  −${mid_paid:.2f} pagado{RESET}"))
+
     print(line(""))
 
 
@@ -495,43 +524,123 @@ def get_cursor_session_token():
         return None, None, f"Error leyendo Cursor: {e}"
 
 
-def fetch_cursor_usage(session_token, user_id):
-    """Llama a la API de uso de Cursor. Devuelve (usage_dict, error_msg)."""
-    url = f"{CURSOR_USAGE_URL}?user={user_id}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Cookie": f"WorkosCursorSessionToken={session_token}",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Referer": "https://cursor.com/dashboard",
-            "Accept": "application/json",
-        },
-    )
+CURSOR_INVOICE_URL = "https://cursor.com/api/dashboard/get-monthly-invoice"
+CURSOR_PRO_INCLUDED_CENTS = 2000  # $20.00 incluidos en Cursor Pro
+
+
+def _cursor_browser_headers(session_token):
+    return {
+        "Cookie": f"WorkosCursorSessionToken={session_token}",
+        "Content-Type": "application/json",
+        "Origin": "https://cursor.com",
+        "Referer": "https://cursor.com/dashboard",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+        "Accept-Language": "en",
+        "Cache-Control": "no-cache",
+    }
+
+
+def _cursor_post(url, body, session_token):
+    """POST JSON a la API de Cursor. Devuelve (data, error_msg)."""
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=_cursor_browser_headers(session_token), method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8")), None
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
+        body_bytes = e.read().decode("utf-8", errors="replace")
         try:
-            err = json.loads(body)
-            msg = err.get("error", err.get("message", body))
+            err = json.loads(body_bytes)
+            msg = err.get("error", err.get("message", body_bytes))
         except json.JSONDecodeError:
-            msg = body or str(e)
-        return None, msg
+            msg = body_bytes or str(e)
+        return None, f"HTTP {e.code}: {msg}"
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
         return None, str(e)
 
-    # Normalizar a estructura con premium (gpt-4) y startOfMonth
-    gpt4 = data.get("gpt-4") or {}
-    current = gpt4.get("numRequests") or 0
-    limit = gpt4.get("maxRequestUsage")
-    if limit is None:
-        limit = 500
-    start_of_month = data.get("startOfMonth") or ""
+
+def fetch_cursor_usage(session_token, user_id):
+    """Obtiene el gasto mensual de Cursor Pro desde get-monthly-invoice.
+
+    Cursor Pro = pool de $20/mes para modelos non-Auto (desde junio 2025).
+    Devuelve (usage_dict, error_msg).
+    """
+    # 1. Obtener startOfMonth desde /api/usage
+    url_usage = f"{CURSOR_USAGE_URL}?user={user_id}"
+    req_usage = urllib.request.Request(url_usage, headers=_cursor_browser_headers(session_token))
+    start_of_month = ""
+    try:
+        with urllib.request.urlopen(req_usage, timeout=10) as resp:
+            raw_usage = json.loads(resp.read().decode("utf-8"))
+        start_of_month = raw_usage.get("startOfMonth") or ""
+    except Exception:
+        pass  # Sin startOfMonth usamos mes actual
+
+    # Calcular mes/año del ciclo de facturación actual
+    now = datetime.now(timezone.utc)
+    if start_of_month:
+        try:
+            ts = start_of_month.replace("Z", "+00:00")
+            if "." in ts:
+                ts = ts.split(".")[0] + "+00:00"
+            sub_start = datetime.fromisoformat(ts)
+            months_since = (now.year - sub_start.year) * 12 + (now.month - sub_start.month)
+            period_month = sub_start.month + months_since
+            period_year = sub_start.year + (period_month - 1) // 12
+            period_month = ((period_month - 1) % 12) + 1
+        except Exception:
+            period_month, period_year = now.month, now.year
+    else:
+        period_month, period_year = now.month, now.year
+
+    # 2. Pedir factura del mes actual
+    invoice, err = _cursor_post(
+        CURSOR_INVOICE_URL,
+        {"month": period_month, "year": period_year, "includeUsageEvents": False},
+        session_token,
+    )
+    if err:
+        # Intentar con mes anterior como fallback
+        prev_month = period_month - 1 or 12
+        prev_year = period_year - (1 if period_month == 1 else 0)
+        invoice, err2 = _cursor_post(
+            CURSOR_INVOICE_URL,
+            {"month": prev_month, "year": prev_year, "includeUsageEvents": False},
+            session_token,
+        )
+        if err2:
+            return None, err  # devolver error original
+
+    items = invoice.get("items") or []
+
+    # 3. Sumar centavos de uso (ignorar pagos a mitad de mes)
+    spent_cents = 0
+    mid_month_cents = 0
+    for item in items:
+        cents = item.get("cents")
+        if cents is None:
+            continue
+        desc = item.get("description") or ""
+        if "Mid-month usage paid" in desc:
+            mid_month_cents += abs(cents)
+        else:
+            spent_cents += max(0, cents)
+
+    spent_dollars = spent_cents / 100.0
+    included_dollars = CURSOR_PRO_INCLUDED_CENTS / 100.0
+
     usage = {
-        "premium": {"current": current, "limit": limit},
+        "spent_dollars": spent_dollars,
+        "included_dollars": included_dollars,
         "startOfMonth": start_of_month,
-        "by_model": {k: v for k, v in data.items() if isinstance(v, dict)},
+        "period_month": period_month,
+        "period_year": period_year,
+        "has_unpaid": invoice.get("hasUnpaidMidMonthInvoice", False),
+        "mid_month_paid": mid_month_cents / 100.0,
     }
     return usage, None
 
