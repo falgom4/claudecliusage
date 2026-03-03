@@ -110,6 +110,31 @@ def get_claude_code_token():
 # Renovación de sesión (cuando el token expira)
 # =============================================================================
 
+def _resolve_claude_cmd():
+    """Devuelve la lista de argumentos para ejecutar claude (ej. [ruta, '--print', '']).
+    Claude Code suele instalarse como alias o en ~/.claude/local/claude; subprocess no
+    expande alias, así que resolvemos la ruta real."""
+    # Ruta típica de instalación de Claude Code
+    home_claude = os.path.expanduser("~/.claude/local/claude")
+    if os.path.isfile(home_claude) and os.access(home_claude, os.X_OK):
+        return [home_claude, "--print", ""]
+    # Si está en PATH como ejecutable directo (sin alias)
+    try:
+        r = subprocess.run(
+            ["which", "claude"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            path = r.stdout.strip().splitlines()[0].strip()
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return [path, "--print", ""]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
 def _is_auth_error(msg):
     """Devuelve True si el mensaje de error indica sesión expirada o token inválido."""
     if not msg:
@@ -121,9 +146,19 @@ def _is_auth_error(msg):
 def refresh_session(render_fn, last_update):
     """Abre claude en background para renovar el token y lo cierra tras SESSION_REFRESH_WAIT s."""
     render_fn(TAB_CLAUDE, None, last_update, "Sesión expirada — renovando credenciales…")
+    claude_cmd = _resolve_claude_cmd()
+    if not claude_cmd:
+        render_fn(
+            TAB_CLAUDE,
+            None,
+            last_update,
+            "No se encontró el comando 'claude'. ¿Está instalado? (Busca en ~/.claude/local/claude o en PATH.)",
+        )
+        time.sleep(POLL_INTERVAL)
+        return
     try:
         proc = subprocess.Popen(
-            ["claude", "--print", ""],
+            claude_cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
