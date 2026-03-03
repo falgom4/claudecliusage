@@ -337,8 +337,13 @@ def _render_cursor_body(usage, last_update, error_msg, w, line):
 
     spent = usage.get("spent_dollars", 0.0)
     included = usage.get("included_dollars", 20.0)
-    pct = int(100 * spent / included) if included else 0
-    pct = min(pct, 100)
+    # Usar el porcentaje de la API (dashboard Spending) si está disponible; si no, calcular desde factura
+    pct = usage.get("usage_pct_from_api")
+    if pct is None:
+        pct = int(100 * spent / included) if included else 0
+        pct = min(pct, 100)
+    else:
+        pct = min(100, max(0, int(pct)))
 
     # Fila principal: barra + porcentaje + costo
     cost_str = f"${spent:.2f} / ${included:.2f}"
@@ -539,6 +544,55 @@ def get_cursor_session_token():
 CURSOR_INVOICE_URL = "https://cursor.com/api/dashboard/get-monthly-invoice"
 CURSOR_PRO_INCLUDED_CENTS = 2000  # $20.00 incluidos en Cursor Pro
 
+# Si existe, guardamos la respuesta de /api/usage para depurar (solo cuando no encontramos %)
+CURSOR_DEBUG_USAGE_FILE = os.environ.get("CURSOR_DEBUG_USAGE_FILE")  # ej. /tmp/cursor_usage.json
+# Porcentaje manual: si la API no lo expone, puedes fijar el mismo valor que en dashboard?tab=spending
+# Ej.: CURSOR_USAGE_PERCENT=8
+CURSOR_USAGE_PERCENT_ENV = os.environ.get("CURSOR_USAGE_PERCENT")
+
+
+def _extract_usage_percentage_from_response(raw_usage):
+    """Extrae el porcentaje 'Total' (Included in Pro) de la respuesta de /api/usage.
+    La web muestra Total X%, Auto+Composer Y%, API Z%. Probamos varias formas de venir en el JSON.
+    """
+    if not raw_usage or not isinstance(raw_usage, dict):
+        return None
+    # Raíz
+    for key in ("used_percentage", "usagePercent", "spendingPercent", "total", "totalPercent", "percent"):
+        v = raw_usage.get(key)
+        if v is not None:
+            try:
+                return max(0, min(100, int(float(v))))
+            except (TypeError, ValueError):
+                pass
+    # Anidado: usage.*, includedInPro.*, etc.
+    for parent in ("usage", "includedInPro", "included", "pro", "spending"):
+        obj = raw_usage.get(parent)
+        if not isinstance(obj, dict):
+            continue
+        for key in ("used_percentage", "usagePercent", "total", "totalPercent", "percent"):
+            v = obj.get(key)
+            if v is not None:
+                try:
+                    return max(0, min(100, int(float(v))))
+                except (TypeError, ValueError):
+                    pass
+    # Array de categorías (ej. [{"name":"Total","percent":8}, ...])
+    for list_key in ("breakdown", "categories", "items", "usageBreakdown"):
+        arr = raw_usage.get(list_key)
+        if isinstance(arr, list):
+            for item in arr:
+                if isinstance(item, dict):
+                    name = (item.get("name") or item.get("label") or "").lower()
+                    if "total" in name:
+                        v = item.get("percent") or item.get("percentage") or item.get("value")
+                        if v is not None:
+                            try:
+                                return max(0, min(100, int(float(v))))
+                            except (TypeError, ValueError):
+                                pass
+    return None
+
 
 def _cursor_browser_headers(session_token):
     return {
@@ -581,14 +635,23 @@ def fetch_cursor_usage(session_token, user_id):
     Cursor Pro = pool de $20/mes para modelos non-Auto (desde junio 2025).
     Devuelve (usage_dict, error_msg).
     """
-    # 1. Obtener startOfMonth desde /api/usage
+    # 1. Obtener startOfMonth y porcentaje de gasto desde /api/usage (mismo dato que dashboard Spending)
     url_usage = f"{CURSOR_USAGE_URL}?user={user_id}"
     req_usage = urllib.request.Request(url_usage, headers=_cursor_browser_headers(session_token))
     start_of_month = ""
+    usage_pct_from_api = None  # Porcentaje que muestra cursor.com/dashboard?tab=spending
     try:
         with urllib.request.urlopen(req_usage, timeout=10) as resp:
             raw_usage = json.loads(resp.read().decode("utf-8"))
         start_of_month = raw_usage.get("startOfMonth") or ""
+        usage_pct_from_api = _extract_usage_percentage_from_response(raw_usage)
+        # Depuración: guardar respuesta si no encontramos % y está configurado
+        if usage_pct_from_api is None and CURSOR_DEBUG_USAGE_FILE:
+            try:
+                with open(CURSOR_DEBUG_USAGE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(raw_usage, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
     except Exception:
         pass  # Sin startOfMonth usamos mes actual
 
@@ -645,9 +708,17 @@ def fetch_cursor_usage(session_token, user_id):
     spent_dollars = spent_cents / 100.0
     included_dollars = CURSOR_PRO_INCLUDED_CENTS / 100.0
 
+    # Si la API no devuelve el %, permitir fijarlo con CURSOR_USAGE_PERCENT (mismo valor que en la web)
+    if usage_pct_from_api is None and CURSOR_USAGE_PERCENT_ENV not in (None, ""):
+        try:
+            usage_pct_from_api = max(0, min(100, int(float(CURSOR_USAGE_PERCENT_ENV))))
+        except (TypeError, ValueError):
+            pass
+
     usage = {
         "spent_dollars": spent_dollars,
         "included_dollars": included_dollars,
+        "usage_pct_from_api": usage_pct_from_api,  # mismo % que dashboard?tab=spending
         "startOfMonth": start_of_month,
         "period_month": period_month,
         "period_year": period_year,
@@ -794,4 +865,109 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--debug-cursor":
+        # Fetch Cursor: /api/usage + get-monthly-invoice, guardar respuestas para inspeccionar
+        if len(sys.argv) > 2:
+            out_dir = os.path.dirname(sys.argv[2]) or "."
+            out_prefix = os.path.basename(sys.argv[2])
+        else:
+            out_dir = "."
+            out_prefix = "cursor_debug"
+        if sys.platform != "darwin":
+            print("Cursor solo en macOS.", file=sys.stderr)
+            sys.exit(1)
+        session_token, user_id, err = get_cursor_session_token()
+        if err:
+            print(err, file=sys.stderr)
+            sys.exit(1)
+        try:
+            # 1. GET /api/usage
+            url_usage = f"{CURSOR_USAGE_URL}?user={user_id}"
+            req = urllib.request.Request(url_usage, headers=_cursor_browser_headers(session_token))
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw_usage = json.loads(resp.read().decode("utf-8"))
+            path_usage = os.path.join(out_dir, out_prefix + "_usage.json")
+            with open(path_usage, "w", encoding="utf-8") as f:
+                json.dump(raw_usage, f, indent=2, ensure_ascii=False)
+            print(f"Usage guardado en {path_usage}")
+            pct = _extract_usage_percentage_from_response(raw_usage)
+            print(f"Porcentaje desde usage: {pct}")
+            # Listar todos los modelos y sus campos (cualquier clave que sea dict con numRequests/numTokens/etc.)
+            model_keys = ("numRequests", "numRequestsTotal", "numTokens", "maxTokenUsage", "maxRequestUsage")
+            print("\n--- Modelos y campos en /api/usage ---")
+            for key, val in sorted(raw_usage.items()):
+                if key == "startOfMonth":
+                    print(f"  startOfMonth: {val}")
+                    continue
+                if isinstance(val, dict) and (model_keys[0] in val or model_keys[2] in val):
+                    print(f"  [{key}]")
+                    for k in model_keys:
+                        print(f"    {k}: {val.get(k)}")
+                elif isinstance(val, dict):
+                    print(f"  [{key}] (objeto): {list(val.keys())}")
+                else:
+                    print(f"  {key}: {val}")
+
+            # 2. POST get-monthly-invoice (mes actual según startOfMonth)
+            start_of_month = raw_usage.get("startOfMonth") or ""
+            now = datetime.now(timezone.utc)
+            period_month, period_year = now.month, now.year
+            if start_of_month:
+                try:
+                    ts = start_of_month.replace("Z", "+00:00").split(".")[0] + "+00:00"
+                    sub_start = datetime.fromisoformat(ts)
+                    months_since = (now.year - sub_start.year) * 12 + (now.month - sub_start.month)
+                    period_month = ((sub_start.month + months_since - 1) % 12) + 1
+                    period_year = sub_start.year + (sub_start.month + months_since - 1) // 12
+                except Exception:
+                    pass
+            for name, include_events in (("invoice", False), ("invoice_events", True)):
+                invoice, err = _cursor_post(
+                    CURSOR_INVOICE_URL,
+                    {"month": period_month, "year": period_year, "includeUsageEvents": include_events},
+                    session_token,
+                )
+                if err:
+                    print(f"Invoice ({name}): {err}", file=sys.stderr)
+                    continue
+                path_inv = os.path.join(out_dir, f"{out_prefix}_{name}.json")
+                with open(path_inv, "w", encoding="utf-8") as f:
+                    json.dump(invoice, f, indent=2, ensure_ascii=False)
+                print(f"Invoice ({name}) guardado en {path_inv}")
+
+            # 3. Probar endpoints que podrían devolver el % del dashboard (Spending)
+            for method, url, body in (
+                ("GET", "https://cursor.com/api/dashboard/usage", None),
+                ("GET", "https://cursor.com/api/dashboard/spending", None),
+                ("GET", "https://cursor.com/api/billing/usage", None),
+                ("GET", "https://cursor.com/api/account/usage", None),
+                ("POST", "https://cursor.com/api/dashboard/usage", {}),
+                ("POST", "https://cursor.com/api/dashboard/spending", {}),
+            ):
+                try:
+                    if method == "GET":
+                        req = urllib.request.Request(url, headers=_cursor_browser_headers(session_token))
+                        with urllib.request.urlopen(req, timeout=8) as resp:
+                            data = json.loads(resp.read().decode("utf-8"))
+                    else:
+                        data, err = _cursor_post(url, body or {}, session_token)
+                        if err:
+                            continue
+                    # Guardar si parece tener uso/porcentaje
+                    flat = json.dumps(data).lower()
+                    if "percent" in flat or "usage" in flat or "total" in flat:
+                        safe = url.replace("https://", "").replace("/", "_")
+                        path_probe = os.path.join(out_dir, f"{out_prefix}_probe_{safe}.json")
+                        with open(path_probe, "w", encoding="utf-8") as f:
+                            json.dump(data, f, indent=2, ensure_ascii=False)
+                        print(f"Probe {method} {url} -> {path_probe}")
+                        pct = _extract_usage_percentage_from_response(data)
+                        if pct is not None:
+                            print(f"  -> Porcentaje extraído: {pct}")
+                except Exception:
+                    pass
+        except Exception as e:
+            print(e, file=sys.stderr)
+            sys.exit(1)
+    else:
+        main()

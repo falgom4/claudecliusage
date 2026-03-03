@@ -66,3 +66,8 @@ En la vista **Cursor** se muestra la barra de premium requests (p. ej. GPT-4) y 
 
 - Asegúrate de estar en macOS y de haber abierto Cursor al menos una vez con la cuenta iniciada. El token se guarda en `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`.
 - Si ves «No hay token en Cursor», abre Cursor, inicia sesión en la cuenta y vuelve a ejecutar el script.
+- **Porcentaje 0% pero en la web ves otro (p. ej. 8%)**: la pestaña [Spending](https://cursor.com/dashboard?tab=spending) usa datos que la API pública no expone. Puedes fijar el mismo valor que ves en la web con la variable de entorno:
+  ```bash
+  CURSOR_USAGE_PERCENT=8 python3 claude-usage-live.py
+  ```
+  Para intentar localizar el endpoint real: abre DevTools (F12) en `cursor.com/dashboard?tab=spending`, pestaña Red, recarga la página y busca una petición cuyo JSON contenga el porcentaje o "Included in Pro".
