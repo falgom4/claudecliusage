@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/fa/Documents/Proyectos-locales/usoclaude/.venv/bin/python3
 """CLI que muestra en tiempo real el uso de Claude Pro y Cursor en la terminal.
 
 Dos vistas: Claude Pro (Keychain + API Anthropic) y Cursor (state.vscdb + cursor.com).
@@ -418,6 +418,33 @@ def _render_cursor_body(usage, last_update, error_msg, w, line):
         mid_paid = usage.get("mid_month_paid", 0.0)
         print(line(f"         {YELLOW}factura parcial pendiente  −${mid_paid:.2f} pagado{RESET}"))
 
+    # Desglose Auto + Composer / API desde el dashboard (Playwright)
+    auto_pct_str = usage.get("auto_composer_pct")
+    api_pct_str = usage.get("api_pct")
+    breakdown_error = usage.get("spending_breakdown_error")
+
+    if auto_pct_str or api_pct_str:
+        print(line(""))
+        header = f"{LABEL}Spending (dashboard){RESET}"
+        print(line(f"         {header}"))
+        if auto_pct_str:
+            try:
+                auto_val = int(str(auto_pct_str).strip().rstrip("%"))
+            except ValueError:
+                auto_val = None
+            color = color_for_pct(auto_val) if auto_val is not None else ACCENT
+            print(line(f"           Auto + Composer: {color}{auto_pct_str}{RESET}"))
+        if api_pct_str:
+            try:
+                api_val = int(str(api_pct_str).strip().rstrip("%"))
+            except ValueError:
+                api_val = None
+            color = color_for_pct(api_val) if api_val is not None else ACCENT
+            print(line(f"           API: {color}{api_pct_str}{RESET}"))
+    elif breakdown_error:
+        print(line(""))
+        print(line(f"         {DIM}{breakdown_error}{RESET}"))
+
     print(line(""))
 
 
@@ -584,6 +611,86 @@ CURSOR_DEBUG_USAGE_FILE = os.environ.get("CURSOR_DEBUG_USAGE_FILE")  # ej. /tmp/
 # Porcentaje manual: si la API no lo expone, puedes fijar el mismo valor que en dashboard?tab=spending
 # Ej.: CURSOR_USAGE_PERCENT=8
 CURSOR_USAGE_PERCENT_ENV = os.environ.get("CURSOR_USAGE_PERCENT")
+
+
+CURSOR_SPENDING_CACHE_TTL = int(os.environ.get("CURSOR_SPENDING_CACHE_TTL", "900"))  # segundos
+_cursor_spending_cache = {
+    "data": None,
+    "last_fetch": 0.0,
+    "error": None,
+}
+
+
+def _fetch_cursor_spending_breakdown_via_browser():
+    """Obtiene los porcentajes 'Auto + Composer' y 'API' desde el dashboard web de Cursor.
+
+    Usa Playwright (Chromium) con un user-data-dir persistente para reutilizar sesión.
+    Devuelve (data, error_msg) donde data es dict con claves:
+      - auto_composer_pct (str, ej. '28%')
+      - api_pct (str, ej. '10%')
+    """
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError:
+        return None, (
+            "Playwright no está instalado. Ejecuta 'pip install playwright' y luego "
+            "'playwright install chromium' para habilitar los porcentajes de Auto + Composer / API."
+        )
+
+    user_data_dir = os.path.expanduser("~/.cursor-playwright-session")
+    auto_pct = None
+    api_pct = None
+
+    try:
+        with sync_playwright() as p:
+            # headless=False la primera vez permite iniciar sesión si hace falta
+            browser = p.chromium.launch_persistent_context(user_data_dir, headless=False)
+            page = browser.new_page()
+            page.goto(
+                "https://cursor.com/en-US/dashboard?tab=spending",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_selector(".flex.justify-between.text-base.text-secondary", timeout=30000)
+            rows = page.query_selector_all(".flex.justify-between.text-base.text-secondary")
+            for row in rows:
+                spans = row.query_selector_all("span")
+                if len(spans) < 2:
+                    continue
+                label = (spans[0].inner_text() or "").strip()
+                value = (spans[1].inner_text() or "").strip()
+                if label == "Auto + Composer":
+                    auto_pct = value
+                elif label == "API":
+                    api_pct = value
+            browser.close()
+    except Exception as e:
+        return None, f"Error Playwright/Spending: {e}"
+
+    if not auto_pct and not api_pct:
+        return None, "No se encontraron filas de Auto + Composer / API en el dashboard de Cursor."
+
+    return {"auto_composer_pct": auto_pct, "api_pct": api_pct}, None
+
+
+def _get_cursor_spending_breakdown_cached():
+    """Cachea la lectura de porcentajes desde el dashboard de Cursor vía Playwright.
+
+    No se hace más de una vez cada CURSOR_SPENDING_CACHE_TTL segundos.
+    Devuelve (data, error_msg).
+    """
+    now_ts = time.time()
+    if (
+        _cursor_spending_cache["data"] is not None
+        and now_ts - _cursor_spending_cache["last_fetch"] < CURSOR_SPENDING_CACHE_TTL
+    ):
+        return _cursor_spending_cache["data"], _cursor_spending_cache["error"]
+
+    data, err = _fetch_cursor_spending_breakdown_via_browser()
+    _cursor_spending_cache["data"] = data
+    _cursor_spending_cache["error"] = err
+    _cursor_spending_cache["last_fetch"] = now_ts
+    return data, err
 
 
 def _extract_usage_percentage_from_response(raw_usage):
@@ -760,6 +867,11 @@ def fetch_cursor_usage(session_token, user_id):
         "has_unpaid": invoice.get("hasUnpaidMidMonthInvoice", False),
         "mid_month_paid": mid_month_cents / 100.0,
     }
+    # Nota: desglose Auto + Composer / API vía Playwright desactivado de momento
+    # por las protecciones anti-bot del dashboard web de Cursor.
+    usage.setdefault("auto_composer_pct", None)
+    usage.setdefault("api_pct", None)
+
     return usage, None
 
 
